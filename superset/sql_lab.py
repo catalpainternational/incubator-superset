@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
 # pylint: disable=C,R,W
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from datetime import datetime
 import logging
 from time import sleep
@@ -14,10 +11,16 @@ import sqlalchemy
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
-from superset import app, dataframe, db, results_backend, security_manager, utils
+from superset import app, dataframe, db, results_backend, security_manager
 from superset.models.sql_lab import Query
 from superset.sql_parse import SupersetQuery
-from superset.utils import get_celery_app, QueryStatus
+from superset.utils.core import (
+    get_celery_app,
+    json_iso_dttm_ser,
+    now_as_float,
+    QueryStatus,
+    zlib_compress,
+)
 
 config = app.config
 celery_app = get_celery_app(config)
@@ -76,14 +79,14 @@ def session_scope(nullpool):
 @celery_app.task(bind=True, soft_time_limit=SQLLAB_TIMEOUT)
 def get_sql_results(
     ctask, query_id, rendered_query, return_results=True, store_results=False,
-        user_name=None):
+        user_name=None, start_time=None):
     """Executes the sql query returns the results."""
     with session_scope(not ctask.request.called_directly) as session:
 
         try:
             return execute_sql(
                 ctask, query_id, rendered_query, return_results, store_results, user_name,
-                session=session)
+                session=session, start_time=start_time)
         except Exception as e:
             logging.exception(e)
             stats_logger.incr('error_sqllab_unhandled')
@@ -97,10 +100,13 @@ def get_sql_results(
 
 def execute_sql(
     ctask, query_id, rendered_query, return_results=True, store_results=False,
-    user_name=None, session=None,
+    user_name=None, session=None, start_time=None,
 ):
     """Executes the sql query returns the results."""
-
+    if store_results and start_time:
+        # only asynchronous queries
+        stats_logger.timing(
+            'sqllab.query.time_pending', now_as_float() - start_time)
     query = get_query(query_id, session)
     payload = dict(query_id=query_id)
 
@@ -144,10 +150,11 @@ def execute_sql(
                 query.user_id, start_dttm.strftime('%Y_%m_%d_%H_%M_%S'))
         executed_sql = superset_query.as_create_table(query.tmp_table_name)
         query.select_as_cta_used = True
-    if (superset_query.is_select() and SQL_MAX_ROWS and
-            (not query.limit or query.limit > SQL_MAX_ROWS)):
-        query.limit = SQL_MAX_ROWS
-        executed_sql = database.apply_limit_to_sql(executed_sql, query.limit)
+    if superset_query.is_select():
+        if SQL_MAX_ROWS and (not query.limit or query.limit > SQL_MAX_ROWS):
+            query.limit = SQL_MAX_ROWS
+        if query.limit:
+            executed_sql = database.apply_limit_to_sql(executed_sql, query.limit)
 
     # Hook to allow environment-specific mutation (usually comments) to the SQL
     SQL_QUERY_MUTATOR = config.get('SQL_QUERY_MUTATOR')
@@ -157,7 +164,7 @@ def execute_sql(
 
     query.executed_sql = executed_sql
     query.status = QueryStatus.RUNNING
-    query.start_running_time = utils.now_as_float()
+    query.start_running_time = now_as_float()
     session.merge(query)
     session.commit()
     logging.info("Set query to 'running'")
@@ -172,11 +179,19 @@ def execute_sql(
         cursor = conn.cursor()
         logging.info('Running query: \n{}'.format(executed_sql))
         logging.info(query.executed_sql)
-        db_engine_spec.execute(cursor, query.executed_sql, async=True)
+        query_start_time = now_as_float()
+        db_engine_spec.execute(cursor, query.executed_sql, async_=True)
         logging.info('Handling cursor')
         db_engine_spec.handle_cursor(cursor, query, session)
         logging.info('Fetching data: {}'.format(query.to_dict()))
+        stats_logger.timing(
+            'sqllab.query.time_executing_query',
+            now_as_float() - query_start_time)
+        fetching_start_time = now_as_float()
         data = db_engine_spec.fetch_data(cursor, query.limit)
+        stats_logger.timing(
+            'sqllab.query.time_fetching_results',
+            now_as_float() - fetching_start_time)
     except SoftTimeLimitExceeded as e:
         logging.exception(e)
         if conn is not None:
@@ -196,7 +211,7 @@ def execute_sql(
         conn.commit()
         conn.close()
 
-    if query.status == utils.QueryStatus.STOPPED:
+    if query.status == QueryStatus.STOPPED:
         return handle_error('The query has been stopped')
 
     cdf = dataframe.SupersetDataFrame(data, cursor_description, db_engine_spec)
@@ -212,7 +227,7 @@ def execute_sql(
                 schema=database.force_ctas_schema,
                 show_cols=False,
                 latest_partition=False))
-    query.end_time = utils.now_as_float()
+    query.end_time = now_as_float()
     session.merge(query)
     session.flush()
 
@@ -225,15 +240,17 @@ def execute_sql(
     if store_results:
         key = '{}'.format(uuid.uuid4())
         logging.info('Storing results in results backend, key: {}'.format(key))
+        write_to_results_backend_start = now_as_float()
         json_payload = json.dumps(
-            payload, default=utils.json_iso_dttm_ser, ignore_nan=True)
+            payload, default=json_iso_dttm_ser, ignore_nan=True)
         cache_timeout = database.cache_timeout
         if cache_timeout is None:
             cache_timeout = config.get('CACHE_DEFAULT_TIMEOUT', 0)
-        results_backend.set(key, utils.zlib_compress(json_payload), cache_timeout)
+        results_backend.set(key, zlib_compress(json_payload), cache_timeout)
         query.results_key = key
-        query.end_result_backend_time = utils.now_as_float()
-
+        stats_logger.timing(
+            'sqllab.query.results_backend_write',
+            now_as_float() - write_to_results_backend_start)
     session.merge(query)
     session.commit()
 
